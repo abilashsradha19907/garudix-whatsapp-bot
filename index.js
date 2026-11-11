@@ -752,14 +752,19 @@ console.log("GARUDIX QR image saved: garudix-qr.png");
         const settings = getGroupSetting(update.id);
 
         for (const participant of update.participants) {
+          const participantJid =
+  typeof participant === "string"
+    ? participant
+    : participant?.id || participant?.jid || participant?.phoneNumber || participant?.lid;
+
+if (!participantJid) continue;
           if (
             update.action === "add" &&
             settings.welcome
           ) {
             await sock.sendMessage(update.id, {
-              text:
-                `🦅 Welcome to the group!\n\n@${participant.split("@")[0]}\n\nPowered by GARUDIX`,
-              mentions: [participant]
+               text: `👋 Welcome to the group!\n\n@${participantJid.split("@")[0]}\n\nPowered by GARUDIX`,
+              mentions: [participantJid]
             });
           }
 
@@ -769,8 +774,8 @@ console.log("GARUDIX QR image saved: garudix-qr.png");
           ) {
             await sock.sendMessage(update.id, {
               text:
-                `👋 Goodbye @${participant.split("@")[0]}\n\n🦅 GARUDIX`,
-              mentions: [participant]
+                `👋 Goodbye @${participantJid.split("@")[0]}
+              mentions: [participantJid]
             });
           }
         }
