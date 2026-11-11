@@ -11,6 +11,7 @@ import QRCode from "qrcode";
 import pino from "pino";
 import { createServer } from "node:http";
 import { spawn } from "node:child_process";
+import ffmpegPath from "ffmpeg-static";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -156,7 +157,7 @@ async function downloadQuoted(sock, msg) {
 
 async function runFFmpeg(args) {
   return new Promise((resolve, reject) => {
-    const process = spawn("ffmpeg", args);
+    const process = spawn(ffmpegPath, args);
 
     let errorText = "";
 
