@@ -747,6 +747,7 @@ console.log("GARUDIX QR image saved: garudix-qr.png");
   sock.ev.on(
     "group-participants.update",
     async update => {
+      console.log("GARUDIX GROUP EVENT:", update.action, update.id, update.participants);
       try {
         const settings = getGroupSetting(update.id);
 
