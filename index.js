@@ -7,11 +7,8 @@ import makeWASocket, {
 } from "@whiskeysockets/baileys";
 
 import qrcode from "qrcode-terminal";
-import QRCode from "qrcode";
 import pino from "pino";
-import { createServer } from "node:http";
 import { spawn } from "node:child_process";
-import ffmpegPath from "ffmpeg-static";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -157,7 +154,7 @@ async function downloadQuoted(sock, msg) {
 
 async function runFFmpeg(args) {
   return new Promise((resolve, reject) => {
-    const process = spawn(ffmpegPath, args);
+    const process = spawn("ffmpeg", args);
 
     let errorText = "";
 
@@ -387,167 +384,122 @@ function calculate(expression) {
 // GROUP HELPERS
 // =============================================
 
-
-// =============================================
-// PERSISTENT GROUP DATA + REMINDERS
-// =============================================
-
-const GROUP_DATA_PATH = path.join(process.cwd(), "garudix-group-data.json");
-const reminderTimers = new Map();
-const spamTracker = new Map();
-let groupData = { settings: {}, rules: {}, reminders: [] };
-
-async function saveGroupData() {
-  const tempPath = GROUP_DATA_PATH + ".tmp";
-  await fs.writeFile(tempPath, JSON.stringify(groupData, null, 2), "utf8");
-  await fs.rename(tempPath, GROUP_DATA_PATH);
-}
-
-async function loadGroupData() {
-  try {
-    const raw = await fs.readFile(GROUP_DATA_PATH, "utf8");
-    const parsed = JSON.parse(raw);
-    groupData = {
-      settings: parsed.settings || {},
-      rules: parsed.rules || {},
-      reminders: Array.isArray(parsed.reminders) ? parsed.reminders : []
-    };
-  } catch (error) {
-    if (error.code !== "ENOENT") {
-      console.error("GARUDIX group data load error:", error.message);
-    }
-    groupData = { settings: {}, rules: {}, reminders: [] };
-  }
-
-  groupSettings.clear();
-  for (const [jid, settings] of Object.entries(groupData.settings)) {
-    groupSettings.set(jid, settings);
-  }
-}
-
-function scheduleReminder(sock, reminder) {
-  if (reminderTimers.has(reminder.id)) return;
-  const delay = reminder.when - Date.now();
-
-  if (delay <= 0) {
-    reminderTimers.set(reminder.id, setTimeout(async () => {
-      try {
-        await sendText(sock, reminder.jid, `⏰ REMINDER\n\n${reminder.message}\n\n🦅 GARUDIX`);
-      } catch (error) {
-        console.error("GARUDIX reminder send error:", error.message);
-      } finally {
-        reminderTimers.delete(reminder.id);
-        groupData.reminders = groupData.reminders.filter(item => item.id !== reminder.id);
-        await saveGroupData().catch(console.error);
-      }
-    }, 0));
-    return;
-  }
-
-  reminderTimers.set(reminder.id, setTimeout(async () => {
-    try {
-      await sendText(sock, reminder.jid, `⏰ REMINDER\n\n${reminder.message}\n\n🦅 GARUDIX`);
-    } catch (error) {
-      console.error("GARUDIX reminder send error:", error.message);
-    } finally {
-      reminderTimers.delete(reminder.id);
-      groupData.reminders = groupData.reminders.filter(item => item.id !== reminder.id);
-      await saveGroupData().catch(console.error);
-    }
-  }, Math.min(delay, 2147483647)));
-}
-
-function syncGroupSettingsToDisk(jid) {
-  groupData.settings[jid] = getGroupSetting(jid);
-  return saveGroupData();
-}
-
 function getGroupSetting(jid) {
   if (!groupSettings.has(jid)) {
     groupSettings.set(jid, {
       antilink: false,
       welcome: true,
-      goodbye: true,
-      antispam: false,
-      ...(groupData.settings[jid] || {})
+      goodbye: true
     });
   }
 
   return groupSettings.get(jid);
 }
 
+function cleanJid(jid) {
+  return String(jid || "").split(":")[0].toLowerCase();
+}
 
-function normalizeAdminId(id) {
-  if (!id) return "";
+async function getJidAliases(sock, jid) {
+  const cleaned = cleanJid(jid);
+  const aliases = new Set();
 
-  return id
-    .replace(/:\d+(?=@)/, "")
-    .toLowerCase();
+  if (!cleaned) return aliases;
+  aliases.add(cleaned);
+
+  // Baileys may identify group members with @lid while the
+  // connected account is represented with @s.whatsapp.net.
+  if (cleaned.endsWith("@lid")) {
+    try {
+      const phoneJid = await sock.signalRepository?.lidMapping
+        ?.getPNForLID?.(cleaned);
+      if (phoneJid) aliases.add(cleanJid(phoneJid));
+    } catch (error) {
+      console.log("LID lookup unavailable:", error.message);
+    }
+  }
+
+  return aliases;
 }
 
 async function getGroupAdmins(sock, jid) {
   const metadata = await sock.groupMetadata(jid);
+  const adminParticipants = metadata.participants.filter(
+    participant =>
+      participant.admin === "admin" ||
+      participant.admin === "superadmin"
+  );
 
-  const admins = metadata.participants
-    .filter(p =>
-      p.admin === "admin" ||
-      p.admin === "superadmin"
-    )
-    .flatMap(p => [
-      p.id,
-      p.lid,
-      p.phoneNumber
-    ])
-    .map(normalizeAdminId)
-    .filter(Boolean);
+  const admins = new Set();
+
+  for (const participant of adminParticipants) {
+    const ids = [
+      participant.id,
+      participant.phoneNumber,
+      participant.lid
+    ];
+
+    for (const id of ids) {
+      const aliases = await getJidAliases(sock, id);
+      for (const alias of aliases) admins.add(alias);
+    }
+  }
 
   return { metadata, admins };
+}
+
+async function isGroupAdmin(sock, admins, jid) {
+  const aliases = await getJidAliases(sock, jid);
+  return [...aliases].some(alias => admins.has(alias));
 }
 
 async function checkGroupAdmin(sock, msg) {
   const jid = msg.key.remoteJid;
 
-  if (!jid.endsWith("@g.us")) {
+  if (!jid || !jid.endsWith("@g.us")) {
     throw new Error("This command works only in groups.");
   }
 
   const { admins } = await getGroupAdmins(sock, jid);
 
   const senderIds = msg.key.fromMe
-    ? [sock.user.id, sock.user.lid, sock.user.phoneNumber]
-    : [msg.key.participant, msg.key.participantAlt];
+    ? [sock.user?.id, sock.user?.lid]
+    : [
+        msg.key.participant,
+        msg.key.participantAlt,
+        msg.key.remoteJidAlt
+      ];
 
-  const senderIsAdmin = senderIds
-    .filter(Boolean)
-    .map(normalizeAdminId)
-    .some(id => admins.includes(id));
-
-  const botIds = [
-    sock.user.id,
-    sock.user.lid,
-    sock.user.phoneNumber
-  ];
-  console.log("GARUDIX ADMIN DEBUG:", {
-  botId: sock.user.id,
-  botLid: sock.user.lid,
-  botPhone: sock.user.phoneNumber,
-  groupAdminIds: admins
-});
-
-  const botIsAdmin = botIds
-    .filter(Boolean)
-    .map(normalizeAdminId)
-    .some(id => admins.includes(id));
+  let senderIsAdmin = false;
+  for (const senderId of senderIds) {
+    if (await isGroupAdmin(sock, admins, senderId)) {
+      senderIsAdmin = true;
+      break;
+    }
+  }
 
   if (!senderIsAdmin) {
     throw new Error("Only group admins can use this command.");
+  }
+
+  const botIds = [
+    sock.user?.id,
+    sock.user?.lid,
+    sock.user?.phoneNumber
+  ];
+
+  let botIsAdmin = false;
+  for (const botId of botIds) {
+    if (await isGroupAdmin(sock, admins, botId)) {
+      botIsAdmin = true;
+      break;
+    }
   }
 
   if (!botIsAdmin) {
     throw new Error("Make GARUDIX a group admin first.");
   }
 }
- 
 
 // =============================================
 // WEATHER - OPEN-METEO
@@ -689,7 +641,6 @@ async function textToSpeech(text) {
 // =============================================
 
 async function startGarudix() {
-  await loadGroupData();
   const { state, saveCreds } =
     await useMultiFileAuthState("./session");
 
@@ -710,20 +661,13 @@ async function startGarudix() {
     } = update;
 
     if (qr) {
-     await QRCode.toFile("./garudix-qr.png", qr, {
-    width: 500,
-    margin: 4,
-    errorCorrectionLevel: "L"
-});
-console.log("GARUDIX QR image saved: garudix-qr.png");
+      console.log("\n🦅 GARUDIX QR CODE\n");
+      qrcode.generate(qr, { small: true });
     }
 
     if (connection === "open") {
       console.log("🦅 GARUDIX CONNECTED SUCCESSFULLY!");
       console.log("Owner number:", OWNER_NUMBER);
-      for (const reminder of groupData.reminders) {
-        scheduleReminder(sock, reminder);
-      }
     }
 
     if (connection === "close") {
@@ -747,24 +691,18 @@ console.log("GARUDIX QR image saved: garudix-qr.png");
   sock.ev.on(
     "group-participants.update",
     async update => {
-      console.log("GARUDIX GROUP EVENT:", update.action, update.id, update.participants);
       try {
         const settings = getGroupSetting(update.id);
 
         for (const participant of update.participants) {
-          const participantJid =
-  typeof participant === "string"
-    ? participant
-    : participant?.id || participant?.jid || participant?.phoneNumber || participant?.lid;
-
-if (!participantJid) continue;
           if (
             update.action === "add" &&
             settings.welcome
           ) {
             await sock.sendMessage(update.id, {
-               text: `👋 Welcome to the group!\n\n@${participantJid.split("@")[0]}\n\nPowered by GARUDIX`,
-              mentions: [participantJid]
+              text:
+                `🦅 Welcome to the group!\n\n@${participant.split("@")[0]}\n\nPowered by GARUDIX`,
+              mentions: [participant]
             });
           }
 
@@ -774,8 +712,8 @@ if (!participantJid) continue;
           ) {
             await sock.sendMessage(update.id, {
               text:
-                `👋 Goodbye @${participantJid.split("@")[0]}
-              mentions: [participantJid]
+                `👋 Goodbye @${participant.split("@")[0]}\n\n🦅 GARUDIX`,
+              mentions: [participant]
             });
           }
         }
@@ -832,14 +770,14 @@ if (!participantJid) continue;
               const { admins } =
                 await getGroupAdmins(sock, jid);
 
-              const sender = normalizeAdminId(msg.key.participant);
+              const sender = msg.key.participant;
 
-              if (!admins.includes(sender)) {
+              if (!(await isGroupAdmin(sock, admins, sender))) {
                 const botJid =
                   sock.user.id.split(":")[0] +
                   "@s.whatsapp.net";
 
-                if (admins.includes(botJid)) {
+                if (await isGroupAdmin(sock, admins, botJid)) {
                   await sock.sendMessage(jid, {
                     delete: msg.key
                   });
@@ -858,43 +796,6 @@ if (!participantJid) continue;
                 }
 
                 continue;
-              }
-            }
-          }
-
-
-          // =====================================
-          // ANTI-SPAM (GROUPS)
-          // =====================================
-
-          if (
-            jid.endsWith("@g.us") &&
-            !msg.key.fromMe &&
-            !body.startsWith(PREFIX)
-          ) {
-            const settings = getGroupSetting(jid);
-            if (settings.antispam) {
-              const { admins } = await getGroupAdmins(sock, jid);
-             const sender = normalizeAdminId(msg.key.participant);
-              if (sender && !admins.includes(sender)) {
-                const now = Date.now();
-                const key = `${jid}:${sender}`;
-                const recent = (spamTracker.get(key) || [])
-                  .filter(timestamp => now - timestamp < 8000);
-                recent.push(now);
-                spamTracker.set(key, recent);
-
-                if (recent.length >= 6) {
-                  spamTracker.set(key, []);
-                  const botJid = sock.user.id.split(":")[0] + "@s.whatsapp.net";
-                  if (admins.includes(botJid)) {
-                    await sock.sendMessage(jid, { delete: msg.key });
-                  }
-                  await sock.sendMessage(jid, {
-                    text: `⚠️ Anti-spam: @${sender.split("@")[0]}, please slow down. Repeated messages are restricted.`,
-                    mentions: [sender]
-                  });
-                }
               }
             }
           }
@@ -1102,14 +1003,6 @@ Ancient Power. Modern Intelligence.`
 │ ..antilink on/off
 │ ..welcome on/off
 │ ..goodbye on/off
-│ ..poll Question | Option 1 | Option 2
-│ ..announce message
-│ ..countdown 10
-│ ..dice
-│ ..random 1 100
-│ ..setrules / ..rules
-│ ..remind 10m message
-│ ..antispam on/off
 ╰━━━━━━━━━━━━━━━━━━━━╯
 
 ╭━━〔 🛠️ UTILITIES 〕━━╮
@@ -1725,124 +1618,6 @@ console.log("GARUDIX TTS: Audio sent successfully.");
           // GROUP POLL
           // ======================================
 
-
-          // =====================================
-          // GROUP POWER PACK
-          // =====================================
-
-          else if (command === "announce") {
-            await checkGroupAdmin(sock, msg);
-            if (!args.trim()) {
-              await sendText(sock, jid, "Usage: ..announce Your announcement");
-              continue;
-            }
-            await sendText(sock, jid, `📢 GROUP ANNOUNCEMENT\n\n${args.trim()}\n\n🦅 GARUDIX`);
-          }
-
-          else if (command === "countdown") {
-            if (!jid.endsWith("@g.us")) {
-              await sendText(sock, jid, "Countdown works only in groups.");
-              continue;
-            }
-            const seconds = Number(args.trim());
-            if (!Number.isInteger(seconds) || seconds < 1 || seconds > 10) {
-              await sendText(sock, jid, "Usage: ..countdown 10\nChoose 1–10 seconds.");
-              continue;
-            }
-            await sendText(sock, jid, `⏳ Countdown started: ${seconds}`);
-            for (let remaining = seconds - 1; remaining > 0; remaining--) {
-              await sleep(1000);
-              await sendText(sock, jid, `⏳ ${remaining}...`);
-            }
-            await sleep(1000);
-            await sendText(sock, jid, "🚀 TIME'S UP! 🦅");
-          }
-
-          else if (command === "dice") {
-            const roll = Math.floor(Math.random() * 6) + 1;
-            const faces = ["⚀", "⚁", "⚂", "⚃", "⚄", "⚅"];
-            await sendText(sock, jid, `🎲 GARUDIX DICE\n\n${faces[roll - 1]} You rolled: ${roll}`);
-          }
-
-          else if (command === "random") {
-            const values = args.trim().split(/\s+/).map(Number);
-            const [min, max] = values;
-            if (values.length !== 2 || !Number.isSafeInteger(min) ||
-                !Number.isSafeInteger(max) || min > max ||
-                max - min > 1000000000) {
-              await sendText(sock, jid, "Usage: ..random 1 100");
-              continue;
-            }
-            const result = Math.floor(Math.random() * (max - min + 1)) + min;
-            await sendText(sock, jid, `🎯 Random number: ${result}`);
-          }
-
-          else if (command === "setrules") {
-            await checkGroupAdmin(sock, msg);
-            if (!args.trim()) {
-              await sendText(sock, jid, "Usage: ..setrules Be respectful | No spam | No links");
-              continue;
-            }
-            groupData.rules[jid] = args.trim().slice(0, 3000);
-            await saveGroupData();
-            await sendText(sock, jid, "✅ Group rules saved. Use ..rules to view them.");
-          }
-
-          else if (command === "rules") {
-            if (!jid.endsWith("@g.us")) {
-              await sendText(sock, jid, "This command works only in groups.");
-              continue;
-            }
-            const rules = groupData.rules[jid];
-            await sendText(sock, jid, rules
-              ? `📜 GROUP RULES\n\n${rules}\n\n🦅 GARUDIX`
-              : "📜 No group rules have been set yet. An admin can use ..setrules Your rules.");
-          }
-
-          else if (command === "remind") {
-            if (!jid.endsWith("@g.us")) {
-              await sendText(sock, jid, "Reminders work only in groups.");
-              continue;
-            }
-            const match = args.trim().match(/^(\d+)(s|m|h)\s+(.+)$/i);
-            if (!match) {
-              await sendText(sock, jid, "Usage: ..remind 10m Drink water\nUnits: s = seconds, m = minutes, h = hours.");
-              continue;
-            }
-            const amount = Number(match[1]);
-            const unit = match[2].toLowerCase();
-            const messageText = match[3].trim();
-            const multiplier = unit === "s" ? 1000 : unit === "m" ? 60000 : 3600000;
-            const delay = amount * multiplier;
-            if (!Number.isSafeInteger(amount) || amount < 1 || delay > 7 * 24 * 60 * 60 * 1000) {
-              await sendText(sock, jid, "Reminder must be between 1 second and 7 days.");
-              continue;
-            }
-            const reminder = {
-              id: `${Date.now()}-${Math.random().toString(36).slice(2, 9)}`,
-              jid,
-              message: messageText.slice(0, 1000),
-              when: Date.now() + delay
-            };
-            groupData.reminders.push(reminder);
-            await saveGroupData();
-            scheduleReminder(sock, reminder);
-            await sendText(sock, jid, `⏰ Reminder set for ${match[1]}${unit} from now.`);
-          }
-
-          else if (command === "antispam") {
-            await checkGroupAdmin(sock, msg);
-            const value = args.trim().toLowerCase();
-            if (!["on", "off"].includes(value)) {
-              await sendText(sock, jid, "Usage: ..antispam on/off");
-              continue;
-            }
-            const settings = getGroupSetting(jid);
-            settings.antispam = value === "on";
-            await syncGroupSettingsToDisk(jid);
-            await sendText(sock, jid, `🛡️ Anti-spam is now ${value.toUpperCase()}. It flags 6 messages within 8 seconds.`);
-          }
-
           else if (command === "poll") {
             if (!jid.endsWith("@g.us")) {
               await sendText(sock, jid, "❌ Poll works only in groups.");
@@ -2029,7 +1804,6 @@ console.log("GARUDIX TTS: Audio sent successfully.");
             const settings = getGroupSetting(jid);
 
             settings[command] = value === "on";
-            await syncGroupSettingsToDisk(jid);
 
             await sendText(
               sock,
