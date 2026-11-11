@@ -826,7 +826,7 @@ console.log("GARUDIX QR image saved: garudix-qr.png");
               const { admins } =
                 await getGroupAdmins(sock, jid);
 
-              const sender = msg.key.participant;
+              const sender = normalizeAdminId(msg.key.participant);
 
               if (!admins.includes(sender)) {
                 const botJid =
@@ -869,7 +869,7 @@ console.log("GARUDIX QR image saved: garudix-qr.png");
             const settings = getGroupSetting(jid);
             if (settings.antispam) {
               const { admins } = await getGroupAdmins(sock, jid);
-              const sender = msg.key.participant;
+             const sender = normalizeAdminId(msg.key.participant);
               if (sender && !admins.includes(sender)) {
                 const now = Date.now();
                 const key = `${jid}:${sender}`;
